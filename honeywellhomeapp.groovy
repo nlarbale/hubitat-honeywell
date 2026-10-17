@@ -393,7 +393,7 @@ def getRefreshIntervalInputs()
     section {
         paragraph "Refresh intervals (how often devices are automatically polled). Every poll counts against your Honeywell API key's rate limit."
         paragraph "Thermostats: one API call per poll covers every thermostat on the account."
-        input name: "refreshIntervals", type: "enum", title: "Thermostat refresh interval", options: ["0":"off", "1":"1 minute", "2":"2 minutes", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
+        input name: "refreshIntervals", type: "enum", title: "Thermostat refresh interval", options: ["0":"off", "1":"1 minute (will exhaust the daily quota)", "2":"2 minutes (likely to exhaust the quota)", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
         paragraph "Remote sensors: one API call per poll for each thermostat that has enabled sensors. Disable individual sensor devices to stop polling them."
         input name: "sensorRefreshInterval", type: "enum", title: "Remote sensor refresh interval", options: ["0":"off", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "0", submitOnChange: true
     }
@@ -618,7 +618,9 @@ def apiRequest(String method, String path, Map query = [:], Map body = null, boo
             httpGet(params, handler)
         }
         result.ok = true
-        LogDebug("API ${method} ${path} status: ${result.status} data: ${result.data}")
+        // Responses can be several KB and include account details (name, email); log only a short preview.
+        def preview = result.data?.toString() ?: ""
+        LogDebug("API ${method} ${path} status: ${result.status} data (${preview.length()} chars): ${preview.take(200)}")
     }
     catch (groovyx.net.http.HttpResponseException e)
     {
@@ -1273,8 +1275,20 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device)
 // Commands
 //
 
+// A range is usable only if the thermostat reports one; heat-only models report the cool range as 0-0.
+def hasSetpointRange(com.hubitat.app.DeviceWrapper device, String minKey, String maxKey)
+{
+    def min = device.getDataValue(minKey)
+    def max = device.getDataValue(maxKey)
+    return min != null && max != null && min.isNumber() && max.isNumber() && (max as BigDecimal) > 0 && (max as BigDecimal) >= (min as BigDecimal)
+}
+
 def clampSetpoint(com.hubitat.app.DeviceWrapper device, BigDecimal value, String minKey, String maxKey)
 {
+    if (!hasSetpointRange(device, minKey, maxKey))
+    {
+        return value
+    }
     def min = device.getDataValue(minKey)
     def max = device.getDataValue(maxKey)
     if (min != null && min.isNumber() && value < (min as BigDecimal))
@@ -1380,7 +1394,8 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     // Honeywell rejects a heat setpoint that isn't below the cool setpoint; move the one that wasn't requested.
     def deadband = device.getDataValue("deadband")
     def gap = (deadband != null && deadband.isNumber() && (deadband as BigDecimal) > 0) ? (deadband as BigDecimal) : (units == "C" ? 1 : 2)
-    if (heatPoint > coolPoint - gap)
+    def heatAndCool = hasSetpointRange(device, "minHeatSetpoint", "maxHeatSetpoint") && hasSetpointRange(device, "minCoolSetpoint", "maxCoolSetpoint")
+    if (heatAndCool && heatPoint > coolPoint - gap)
     {
         if (heatRequested)
         {
