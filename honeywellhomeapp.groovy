@@ -29,8 +29,9 @@ import groovy.transform.Field
 
 // Don't refresh the OAuth token more than once in this window; concurrent 401s would otherwise race on the refresh token.
 @Field static long global_tokenRefreshGuardMs = 60 * 1000
-// Back-off used when Honeywell returns 429 without a Retry-After header.
+// Back-off used when Honeywell returns 429 without a Retry-After header; doubles (up to the max) if the limit is hit again soon after resuming.
 @Field static int global_rateLimitBackoffSec = 15 * 60
+@Field static int global_rateLimitMaxBackoffSec = 4 * 60 * 60
 // Delay before re-reading thermostats after a command; multiple commands inside this window share one API call.
 @Field static int global_commandRefreshDelaySec = 15
 
@@ -39,7 +40,7 @@ definition(
         namespace: "thecloudtaylor",
         author: "Taylor Brown",
         description: "App for Lyric (LCC) and T series (TCC) Honeywell Thermostats, requires corresponding driver.",
-        importUrl:"https://raw.githubusercontent.com/thecloudtaylor/hubitat-honeywell/main/honeywellhomeapp.groovy",
+        importUrl:"https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellhomeapp.groovy",
         category: "Thermostate",
         iconUrl: "",
         iconX2Url: "")
@@ -79,8 +80,11 @@ def mainPage() {
             if (isRateLimited())
             {
                 section {
-                    paragraph "<b>Honeywell rate limit hit.</b> Scheduled polling is paused until ${new Date(atomicState.rateLimitedUntil as Long)}."
+                    paragraph "<b>Honeywell rate limit hit.</b> Polling and refreshes are paused until ${new Date(atomicState.rateLimitedUntil as Long)}. Thermostat commands still go through."
                 }
+            }
+            section {
+                paragraph "Honeywell API calls: ${getApiUsageSummary()}"
             }
             getDiscoverButton()
             listDiscoveredDevices()
@@ -389,7 +393,7 @@ def getRefreshIntervalInputs()
     section {
         paragraph "Refresh intervals (how often devices are automatically polled). Every poll counts against your Honeywell API key's rate limit."
         paragraph "Thermostats: one API call per poll covers every thermostat on the account."
-        input name: "refreshIntervals", type: "enum", title: "Thermostat refresh interval", options: ["0":"off", "1":"1 minute", "2":"2 minutes", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
+        input name: "refreshIntervals", type: "enum", title: "Thermostat refresh interval", options: ["0":"off", "1":"1 minute (will exhaust the daily quota)", "2":"2 minutes (likely to exhaust the quota)", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
         paragraph "Remote sensors: one API call per poll for each thermostat that has enabled sensors. Disable individual sensor devices to stop polling them."
         input name: "sensorRefreshInterval", type: "enum", title: "Remote sensor refresh interval", options: ["0":"off", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "0", submitOnChange: true
     }
@@ -487,9 +491,48 @@ def isRateLimited()
     return until != null && now() < (until as Long)
 }
 
+// Counts calls per clock hour and per day so the app page and rate limit warnings show actual usage.
+def countApiCall()
+{
+    def date = new Date(now())
+    def hourKey = date.format("yyyy-MM-dd HH")
+    def dayKey = date.format("yyyy-MM-dd")
+    def usage = atomicState.apiUsage ?: [:]
+    if (usage.day != dayKey)
+    {
+        usage.day = dayKey
+        usage.dayCount = 0
+    }
+    if (usage.hour != hourKey)
+    {
+        usage.hour = hourKey
+        usage.hourCount = 0
+    }
+    usage.dayCount = (usage.dayCount ?: 0) + 1
+    usage.hourCount = (usage.hourCount ?: 0) + 1
+    atomicState.apiUsage = usage
+}
+
+def getApiUsageSummary()
+{
+    def usage = atomicState.apiUsage
+    def date = new Date(now())
+    def today = (usage?.day == date.format("yyyy-MM-dd")) ? usage.dayCount : 0
+    def thisHour = (usage?.hour == date.format("yyyy-MM-dd HH")) ? usage.hourCount : 0
+    return "${today} today, ${thisHour} this hour"
+}
+
 def noteRateLimited(groovyx.net.http.HttpResponseException e)
 {
+    // Hit again within an hour of the last pause ending: the limit window is longer than our back-off, so double it.
+    def lastUntil = atomicState.rateLimitedUntil
+    def lastBackoff = atomicState.rateLimitBackoffSec ?: global_rateLimitBackoffSec
     def backoffSec = global_rateLimitBackoffSec
+    if (lastUntil != null && now() - (lastUntil as Long) < 60 * 60 * 1000L)
+    {
+        backoffSec = Math.min(lastBackoff * 2, global_rateLimitMaxBackoffSec)
+    }
+
     try
     {
         def retryAfter = e.response?.getFirstHeader("Retry-After")?.getValue()
@@ -502,8 +545,9 @@ def noteRateLimited(groovyx.net.http.HttpResponseException e)
     {
         // no usable Retry-After header
     }
+    atomicState.rateLimitBackoffSec = backoffSec
     atomicState.rateLimitedUntil = now() + (backoffSec * 1000L)
-    LogWarn("Honeywell API rate limit hit; pausing scheduled polling for ${backoffSec} seconds. Consider longer refresh intervals.")
+    LogWarn("Honeywell API rate limit hit (calls: ${getApiUsageSummary()}); pausing polling and refreshes for ${backoffSec / 60} minutes. Honeywell said: ${e.response?.data}")
 }
 
 // Scheduled polls back off while rate limited or while authorization is known to be broken. User commands still go through.
@@ -535,6 +579,16 @@ def apiRequest(String method, String path, Map query = [:], Map body = null, boo
         return result
     }
 
+    // While rate limited, reads (polls, manual refreshes, discovery) would only extend the penalty; commands still go through.
+    if (method != "POST" && isRateLimited())
+    {
+        LogWarn("Skipping ${path}: Honeywell rate limit, retry after ${new Date(atomicState.rateLimitedUntil as Long)}")
+        result.status = 429
+        return result
+    }
+
+    countApiCall()
+
     def params = [
         uri: global_apiURL,
         path: path,
@@ -564,7 +618,9 @@ def apiRequest(String method, String path, Map query = [:], Map body = null, boo
             httpGet(params, handler)
         }
         result.ok = true
-        LogDebug("API ${method} ${path} status: ${result.status} data: ${result.data}")
+        // Responses can be several KB and include account details (name, email); log only a short preview.
+        def preview = result.data?.toString() ?: ""
+        LogDebug("API ${method} ${path} status: ${result.status} data (${preview.length()} chars): ${preview.take(200)}")
     }
     catch (groovyx.net.http.HttpResponseException e)
     {
@@ -583,7 +639,10 @@ def apiRequest(String method, String path, Map query = [:], Map body = null, boo
         {
             noteRateLimited(e)
         }
-        LogError("Honeywell API ${method} ${path} failed (${result.status}): ${e.response?.data}")
+        else
+        {
+            LogError("Honeywell API ${method} ${path} failed (${result.status}): ${e.response?.data}")
+        }
     }
     catch (Exception e)
     {
@@ -728,6 +787,7 @@ def requestToken(Map body)
                     Accept: "application/json"
                 ]
     def params = [uri: global_apiURL, path: "/oauth2/token", headers: headers, body: body, timeout: 30]
+    countApiCall()
 
     try
     {
@@ -1215,8 +1275,20 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device)
 // Commands
 //
 
+// A range is usable only if the thermostat reports one; heat-only models report the cool range as 0-0.
+def hasSetpointRange(com.hubitat.app.DeviceWrapper device, String minKey, String maxKey)
+{
+    def min = device.getDataValue(minKey)
+    def max = device.getDataValue(maxKey)
+    return min != null && max != null && min.isNumber() && max.isNumber() && (max as BigDecimal) > 0 && (max as BigDecimal) >= (min as BigDecimal)
+}
+
 def clampSetpoint(com.hubitat.app.DeviceWrapper device, BigDecimal value, String minKey, String maxKey)
 {
+    if (!hasSetpointRange(device, minKey, maxKey))
+    {
+        return value
+    }
     def min = device.getDataValue(minKey)
     def max = device.getDataValue(maxKey)
     if (min != null && min.isNumber() && value < (min as BigDecimal))
@@ -1322,7 +1394,8 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     // Honeywell rejects a heat setpoint that isn't below the cool setpoint; move the one that wasn't requested.
     def deadband = device.getDataValue("deadband")
     def gap = (deadband != null && deadband.isNumber() && (deadband as BigDecimal) > 0) ? (deadband as BigDecimal) : (units == "C" ? 1 : 2)
-    if (heatPoint > coolPoint - gap)
+    def heatAndCool = hasSetpointRange(device, "minHeatSetpoint", "maxHeatSetpoint") && hasSetpointRange(device, "minCoolSetpoint", "maxCoolSetpoint")
+    if (heatAndCool && heatPoint > coolPoint - gap)
     {
         if (heatRequested)
         {
