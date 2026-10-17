@@ -62,6 +62,7 @@ mappings {
 
 
 def mainPage() {
+    migrateTokensToAtomicState()
     dynamicPage(name: "mainPage", title: "Honeywell Home", install: true, uninstall: true) {
         installCheck()
         if(state.appInstalled == 'COMPLETE')
@@ -196,6 +197,7 @@ def initialize()
 {
     LogInfo("Initializing Honeywell Home.");
     unschedule()
+    migrateTokensToAtomicState()
 
     if (atomicState.refresh_token == null)
     {
@@ -384,11 +386,6 @@ def listDiscoveredDevices() {
 
 def getRefreshIntervalInputs()
 {
-    if (atomicState.access_token == null)
-    {
-        return
-    }
-
     section {
         paragraph "Refresh intervals (how often devices are automatically polled). Every poll counts against your Honeywell API key's rate limit."
         paragraph "Thermostats: one API call per poll covers every thermostat on the account."
@@ -470,6 +467,19 @@ def isRemoteSensor(com.hubitat.app.DeviceWrapper device)
 //
 // Honeywell API access
 //
+
+// Older versions kept the Honeywell tokens in state; copy them over so upgrades stay connected.
+def migrateTokensToAtomicState()
+{
+    if (atomicState.access_token == null && state.access_token != null)
+    {
+        atomicState.access_token = state.access_token
+    }
+    if (atomicState.refresh_token == null && state.refresh_token != null)
+    {
+        atomicState.refresh_token = state.refresh_token
+    }
+}
 
 def isRateLimited()
 {
