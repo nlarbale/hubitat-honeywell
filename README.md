@@ -22,6 +22,7 @@ How the app spends API calls:
 - **Thermostat polling**: one call per interval covers every thermostat on the account (default every 10 minutes).
 - **Remote sensor polling**: separate, optional interval (off by default). One call per interval for each thermostat that has enabled sensors, no matter how many sensors it has. Disable a sensor device to stop polling it; if all sensors on a thermostat are disabled no call is made.
 - **Commands**: the change is reflected on the device immediately, then a single refresh of all thermostats runs ~15 seconds later. Several commands in quick succession share that one refresh.
+- **Adaptive thermostat polling** (optional): polls at the fast interval (e.g. 1 minute) while any thermostat is heating/cooling or within the near-setpoint range of its setpoint, and at the idle interval (e.g. 15 minutes) otherwise. With a daily call budget set, intervals stretch automatically so the day's calls stay under it. The app page shows calls today/this hour and when the next poll is due.
 - **Rate limited (HTTP 429)**: scheduled polling pauses (honoring `Retry-After`, otherwise 15 minutes) and the app page shows when it resumes. Commands still go through.
 
 ### Not Yet Implemented/Tested
@@ -34,3 +35,9 @@ How the app spends API calls:
 ## Credits
 - I got a lot of example and inspiration from @dkilgore90 (https://github.com/dkilgore90/google-sdm-api/blob/develop/sdm-api-app.groovy)
 - Credit to Tim in the Hubitat community for patently testing and improving this with me over days/weeks.
+
+## Holds and schedules (Lyric/LCC models)
+Changing a setpoint or mode from Hubitat places a hold on the thermostat's Honeywell schedule. Each thermostat's preferences choose the hold type: **permanent** (default; the schedule stays paused) or **for a number of hours**, after which the thermostat resumes its schedule. The **Resume Schedule** command clears any hold. The current hold is shown in the `holdStatus` attribute.
+
+## Runtime tracking
+Each thermostat reports `heatingRuntimeToday`, `coolingRuntimeToday`, `heatingRuntimeYesterday` and `coolingRuntimeYesterday` (minutes) and `lastOperatingStateChange`. Runtime is accumulated between polls; a heating/cooling start or stop is assumed to have happened halfway between the two polls that saw it, so timing error is at most half the poll interval (cycles shorter than the interval can still be missed). Gaps longer than 65 minutes (outages, rate limit pauses) are not credited. For exact equipment timing, pair this with a local sensor (e.g. a current clamp or 24VAC call sensor) and use these attributes to see which thermostat was calling.

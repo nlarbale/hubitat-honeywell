@@ -34,6 +34,10 @@ import groovy.transform.Field
 @Field static int global_rateLimitMaxBackoffSec = 4 * 60 * 60
 // Delay before re-reading thermostats after a command; multiple commands inside this window share one API call.
 @Field static int global_commandRefreshDelaySec = 15
+// Adaptive polling never waits longer than this, even when stretching to fit the daily budget.
+@Field static int global_maxPollIntervalSec = 60 * 60
+// Gaps between polls longer than this (outages, rate limit pauses) aren't credited to runtime; the state in between is unknown.
+@Field static long global_maxRuntimeGapMs = 65 * 60 * 1000L
 
 definition(
         name: "Honeywell Home",
@@ -84,7 +88,7 @@ def mainPage() {
                 }
             }
             section {
-                paragraph "Honeywell API calls: ${getApiUsageSummary()}"
+                paragraph "Honeywell API calls: ${getApiUsageSummary()}${getAdaptiveStatusSummary()}"
             }
             getDiscoverButton()
             listDiscoveredDevices()
@@ -212,7 +216,14 @@ def initialize()
     refreshToken()
     RefreshAllDevices()
 
-    if (scheduleRefresh("RefreshAllDevices", refreshIntervals ?: "10"))
+    if (isAdaptivePolling())
+    {
+        scheduleNextAdaptivePoll()
+        // Restarts the runIn chain if it ever stops (e.g. an exception mid-poll).
+        schedule("${(int)(Math.random() * 60)} */30 * ? * *", "adaptiveWatchdog")
+        LogInfo("Adaptive thermostat polling enabled.")
+    }
+    else if (scheduleRefresh("RefreshAllDevices", refreshIntervals ?: "10"))
     {
         LogDebug("Thermostat polling scheduled every ${refreshIntervals ?: '10'} minutes.")
     }
@@ -393,7 +404,20 @@ def getRefreshIntervalInputs()
     section {
         paragraph "Refresh intervals (how often devices are automatically polled). Every poll counts against your Honeywell API key's rate limit."
         paragraph "Thermostats: one API call per poll covers every thermostat on the account."
-        input name: "refreshIntervals", type: "enum", title: "Thermostat refresh interval", options: ["0":"off", "1":"1 minute (will exhaust the daily quota)", "2":"2 minutes (likely to exhaust the quota)", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
+        input name: "thermostatPollingMode", type: "enum", title: "Thermostat polling", options: ["fixed":"Fixed interval", "adaptive":"Adaptive (fast while heating/cooling or near setpoint)"], required: true, defaultValue: "fixed", submitOnChange: true
+    }
+    if (isAdaptivePolling())
+    {
+        section {
+            paragraph "Adaptive polling uses the fast interval while any thermostat is heating or cooling, or its temperature is within the near-setpoint range, and the idle interval otherwise. With a daily budget, intervals stretch automatically so the day's calls stay under it (token refreshes, remote sensor polls and a small reserve for commands are accounted for)."
+            input name: "fastPollMinutes", type: "enum", title: "Fast interval", options: ["1":"1 minute", "2":"2 minutes", "3":"3 minutes", "5":"5 minutes"], required: true, defaultValue: "1", submitOnChange: true
+            input name: "idlePollMinutes", type: "enum", title: "Idle interval", options: ["5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "15", submitOnChange: true
+            input name: "nearSetpointDegrees", type: "decimal", title: "Near-setpoint range (degrees, in the thermostat's units)", required: true, defaultValue: 1.0, submitOnChange: true
+            input name: "dailyCallBudget", type: "number", title: "Daily API call budget (0 = no budget)", required: true, defaultValue: 0, submitOnChange: true
+        }
+    }
+    section {
+        input name: "refreshIntervals", type: "enum", title: isAdaptivePolling() ? "Fixed interval (not used while adaptive polling is on)" : "Thermostat refresh interval", options: ["0":"off", "1":"1 minute (will exhaust the daily quota)", "2":"2 minutes (likely to exhaust the quota)", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "10", submitOnChange: true
         paragraph "Remote sensors: one API call per poll for each thermostat that has enabled sensors. Disable individual sensor devices to stop polling them."
         input name: "sensorRefreshInterval", type: "enum", title: "Remote sensor refresh interval", options: ["0":"off", "5":"5 minutes", "10":"10 minutes", "15":"15 minutes", "30":"30 minutes", "60":"60 minutes"], required: true, defaultValue: "0", submitOnChange: true
     }
@@ -461,6 +485,20 @@ def parseThermostatDni(String dni)
         return null
     }
     return [locationId: dni.substring(0, delimiter), deviceId: dni.substring(delimiter + 3)]
+}
+
+// Sensors created while room names couldn't be fetched (e.g. rate limited) are labelled "... Thermostat Sensor: Room <id>".
+// Replace that placeholder with the real room name; labels the user changed are left alone.
+def fixPlaceholderSensorLabel(com.hubitat.app.DeviceWrapper sensor, roomId, roomName)
+{
+    def label = sensor.getLabel()
+    def placeholderSuffix = " Thermostat Sensor: Room ${roomId}".toString()
+    if (roomName && label?.endsWith(placeholderSuffix) && roomName.toString() != "Room ${roomId}".toString())
+    {
+        def newLabel = label.substring(0, label.length() - placeholderSuffix.length()) + " Thermostat Sensor: ${roomName}"
+        LogInfo("Renaming sensor '${label}' to '${newLabel}'")
+        sensor.setLabel(newLabel)
+    }
 }
 
 def isRemoteSensor(com.hubitat.app.DeviceWrapper device)
@@ -663,6 +701,8 @@ def discoverDevices()
         return
     }
 
+    def addedThermostats = false
+    def addedSensors = false
     result.data?.each {locations ->
         def locationID = locations.locationID.toString()
         LogDebug("LocationID: ${locationID}");
@@ -680,6 +720,7 @@ def discoverDevices()
                                     name : "Honeywell - ${dev.deviceModel.toString()} - ${dev.deviceID.toString()}",
                                     label: dev.userDefinedDeviceName.toString()
                             ])
+                    addedThermostats = true
                  }
                 catch (com.hubitat.app.exception.UnknownDeviceTypeException e) {
                     LogInfo("${e.message} - you need to install the appropriate driver.")
@@ -717,12 +758,17 @@ def discoverDevices()
                                                 name : "Honeywell Home Remote Sensor",
                                                 label: "${dev.userDefinedDeviceName} Thermostat Sensor: ${roomName}"
                                         ])
+                                    addedSensors = true
                                 }
                                 catch (com.hubitat.app.exception.UnknownDeviceTypeException e)
                                 {
                                     LogInfo("${e.message} - you need to install the appropriate driver.")
                                     return
                                 }
+                            }
+                            else
+                            {
+                                fixPlaceholderSensorLabel(sensor, room, roomNames[room as Integer])
                             }
 
                             // (Re)apply identifiers so rediscovery repairs existing sensors too.
@@ -736,6 +782,16 @@ def discoverDevices()
                 }
             }
         }
+    }
+
+    // New devices don't refresh themselves; populate them all with one call (plus one per thermostat with new sensors).
+    if (addedThermostats)
+    {
+        RefreshAllDevicesUnified()
+    }
+    if (addedSensors)
+    {
+        RefreshAllRemoteSensors(true)
     }
 }
 
@@ -942,6 +998,230 @@ def RefreshAllDevices()
     RefreshAllDevicesUnified()
 }
 
+//
+// Adaptive polling: a runIn chain whose next delay depends on what the thermostats are doing.
+//
+
+def isAdaptivePolling()
+{
+    return settings.thermostatPollingMode == "adaptive"
+}
+
+def adaptivePoll()
+{
+    LogDebug("adaptivePoll()")
+    try
+    {
+        RefreshAllDevices()
+    }
+    finally
+    {
+        scheduleNextAdaptivePoll()
+    }
+}
+
+def adaptiveWatchdog()
+{
+    def nextAt = atomicState.nextAdaptivePollAt
+    if (isAdaptivePolling() && (nextAt == null || now() > (nextAt as Long) + 5 * 60 * 1000L))
+    {
+        LogWarn("Adaptive polling had stopped; restarting.")
+        scheduleNextAdaptivePoll()
+    }
+}
+
+def scheduleNextAdaptivePoll()
+{
+    def plan = computeAdaptivePlan()
+    atomicState.nextAdaptivePollAt = now() + plan.seconds * 1000L
+    atomicState.adaptiveReason = plan.reason
+    LogDebug("Next adaptive poll in ${plan.seconds}s (${plan.reason})")
+    runIn(plan.seconds, "adaptivePoll")
+}
+
+// Returns [seconds: Integer, reason: String].
+def computeAdaptivePlan()
+{
+    def fastSec = ((settings.fastPollMinutes ?: "1").toString() as Integer) * 60
+    def idleSec = ((settings.idlePollMinutes ?: "15").toString() as Integer) * 60
+
+    if (isRateLimited())
+    {
+        def waitSec = (int)(((atomicState.rateLimitedUntil as Long) - now()) / 1000) + 30
+        return [seconds: Math.max(waitSec, 60), reason: "rate limited"]
+    }
+    if (atomicState.authError)
+    {
+        return [seconds: idleSec, reason: "authorization error"]
+    }
+
+    def activity = getThermostatActivity()
+    def seconds = activity ? fastSec : idleSec
+    def reason = activity ?: "idle"
+
+    def budgetSec = getBudgetMinimumIntervalSec()
+    if (budgetSec != null && budgetSec > seconds)
+    {
+        seconds = budgetSec
+        reason = "${reason}, stretched for daily budget"
+    }
+    return [seconds: Math.min(seconds, global_maxPollIntervalSec), reason: reason]
+}
+
+// Describes why fast polling is needed ("Hallway heating", "Hallway near setpoint"), or null when everything is idle.
+def getThermostatActivity()
+{
+    def near = (settings.nearSetpointDegrees != null ? settings.nearSetpointDegrees : 1.0) as BigDecimal
+    for (thermostat in getChildDevices().findAll { parseThermostatDni(it.getDeviceNetworkId()) != null && !it.isDisabled() })
+    {
+        def operating = thermostat.currentValue("thermostatOperatingState")
+        if (operating == "heating" || operating == "cooling")
+        {
+            return "${thermostat.getLabel()} ${operating}"
+        }
+
+        def mode = thermostat.currentValue("thermostatMode")
+        def temperature = thermostat.currentValue("temperature")
+        if (temperature == null || !temperature.toString().isNumber())
+        {
+            continue
+        }
+        temperature = temperature as BigDecimal
+        def heatSetpoint = thermostat.currentValue("heatingSetpoint")
+        def coolSetpoint = thermostat.currentValue("coolingSetpoint")
+        def heats = mode in ["heat", "emergency heat", "auto"]
+        def cools = mode in ["cool", "auto"]
+        if ((heats && heatSetpoint != null && temperature <= (heatSetpoint as BigDecimal) + near) ||
+            (cools && coolSetpoint != null && temperature >= (coolSetpoint as BigDecimal) - near))
+        {
+            return "${thermostat.getLabel()} near setpoint"
+        }
+    }
+    return null
+}
+
+// Shortest poll interval that keeps the rest of today's calls under dailyCallBudget, or null without a budget.
+def getBudgetMinimumIntervalSec()
+{
+    def budget = (settings.dailyCallBudget ?: 0) as Integer
+    if (budget <= 0)
+    {
+        return null
+    }
+
+    def nowMs = now()
+    def endOfDay = (new Date(nowMs).clearTime() + 1).getTime()
+    long remainingSec = Math.max((long)((endOfDay - nowMs) / 1000), 60L)
+
+    def usage = atomicState.apiUsage
+    def usedToday = (usage?.day == new Date(nowMs).format("yyyy-MM-dd")) ? (usage.dayCount ?: 0) : 0
+
+    // Calls that will happen regardless of thermostat polling.
+    def tokenCalls = remainingSec / 1800 + 1
+    def sensorMinutes = (settings.sensorRefreshInterval ?: "0").toString() as Integer
+    def sensorCalls = sensorMinutes > 0 ? (remainingSec / (sensorMinutes * 60)) * getRemoteSensorsByThermostat().count { k, v -> v.any { !it.isDisabled() } } : 0
+    def commandReserve = budget * 0.05
+
+    def available = budget - usedToday - tokenCalls - sensorCalls - commandReserve
+    if (available < 1)
+    {
+        return global_maxPollIntervalSec
+    }
+    return (int)Math.ceil((remainingSec / available) as double)
+}
+
+def getAdaptiveStatusSummary()
+{
+    if (!isAdaptivePolling() || atomicState.nextAdaptivePollAt == null)
+    {
+        return ""
+    }
+    def seconds = Math.max(0, (int)(((atomicState.nextAdaptivePollAt as Long) - now()) / 1000))
+    return "<br>Adaptive polling: next poll in ${seconds}s (${escapeHtml(atomicState.adaptiveReason)})"
+}
+
+//
+// Runtime tracking: heating/cooling time accumulated between polls. A state change is assumed to have happened halfway
+// between the two polls that saw it, which halves the timing error compared to crediting it at either poll.
+//
+
+def updateRuntime(com.hubitat.app.DeviceWrapper device, String operatingState)
+{
+    def nowMs = now()
+    def dni = device.getDeviceNetworkId()
+    def runtimes = atomicState.runtimes ?: [:]
+    def rec = runtimes[dni] ?: [state: operatingState, lastPoll: nowMs, day: new Date(nowMs).format("yyyy-MM-dd"), heatSec: 0, coolSec: 0, yesterdayHeatSec: 0, yesterdayCoolSec: 0]
+
+    def lastPoll = rec.lastPoll as Long
+    def gap = nowMs - lastPoll
+    if (gap > 0 && gap <= global_maxRuntimeGapMs)
+    {
+        if (rec.state == operatingState)
+        {
+            creditRuntime(rec, rec.state, lastPoll, nowMs)
+        }
+        else
+        {
+            def changedAt = lastPoll + (long)(gap / 2)
+            creditRuntime(rec, rec.state, lastPoll, changedAt)
+            creditRuntime(rec, operatingState, changedAt, nowMs)
+            sendEvent(device, [name: "lastOperatingStateChange", value: new Date(changedAt).format("yyyy-MM-dd'T'HH:mm:ssZ"), descriptionText: "${rec.state} -> ${operatingState} at about ${new Date(changedAt).format('HH:mm')}"])
+        }
+    }
+    else if (rec.state != operatingState)
+    {
+        // Change seen after a gap too long to estimate; record that it happened by now.
+        sendEvent(device, [name: "lastOperatingStateChange", value: new Date(nowMs).format("yyyy-MM-dd'T'HH:mm:ssZ"), descriptionText: "${rec.state} -> ${operatingState} (time unknown, seen after a polling gap)"])
+    }
+    rollRuntimeDay(rec, new Date(nowMs).format("yyyy-MM-dd"))
+
+    rec.state = operatingState
+    rec.lastPoll = nowMs
+    runtimes[dni] = rec
+    atomicState.runtimes = runtimes
+
+    sendEvent(device, [name: "heatingRuntimeToday", value: (int)((rec.heatSec as Long) / 60), unit: "min"])
+    sendEvent(device, [name: "coolingRuntimeToday", value: (int)((rec.coolSec as Long) / 60), unit: "min"])
+    sendEvent(device, [name: "heatingRuntimeYesterday", value: (int)((rec.yesterdayHeatSec as Long) / 60), unit: "min"])
+    sendEvent(device, [name: "coolingRuntimeYesterday", value: (int)((rec.yesterdayCoolSec as Long) / 60), unit: "min"])
+}
+
+// Adds [fromMs, toMs) of the given state to the record, splitting at midnight so each day gets its own share.
+def creditRuntime(Map rec, String state, long fromMs, long toMs)
+{
+    def from = fromMs
+    while (from < toMs)
+    {
+        def dayStart = new Date(from).clearTime()
+        def segmentEnd = Math.min(toMs, (dayStart + 1).getTime())
+        rollRuntimeDay(rec, dayStart.format("yyyy-MM-dd"))
+        def seconds = (long)((segmentEnd - from) / 1000)
+        if (state == "heating")
+        {
+            rec.heatSec = (rec.heatSec as Long) + seconds
+        }
+        else if (state == "cooling")
+        {
+            rec.coolSec = (rec.coolSec as Long) + seconds
+        }
+        from = segmentEnd
+    }
+}
+
+def rollRuntimeDay(Map rec, String dayKey)
+{
+    if (rec.day == dayKey)
+    {
+        return
+    }
+    def yesterdayKey = (Date.parse("yyyy-MM-dd", dayKey) - 1).format("yyyy-MM-dd")
+    rec.yesterdayHeatSec = (rec.day == yesterdayKey) ? rec.heatSec : 0
+    rec.yesterdayCoolSec = (rec.day == yesterdayKey) ? rec.coolSec : 0
+    rec.heatSec = 0
+    rec.coolSec = 0
+    rec.day = dayKey
+}
+
 // Deferred, coalesced refresh after a command so the cloud has time to reflect the change.
 def refreshAfterCommand()
 {
@@ -951,6 +1231,11 @@ def refreshAfterCommand()
         return
     }
     RefreshAllDevicesUnified()
+    if (isAdaptivePolling())
+    {
+        // A command may have started heating/cooling; re-plan so fast polling starts now rather than after an idle wait.
+        scheduleNextAdaptivePoll()
+    }
 }
 
 def scheduleCommandRefresh()
@@ -1080,6 +1365,11 @@ def refreshThermostatNew(com.hubitat.app.DeviceWrapper device, def reJson)
     refreshHelper(changeableValues, "heatSetpoint", "heatingSetpoint", device, tempUnits, false, false)
     refreshHelper(changeableValues, "coolSetpoint", "coolingSetpoint", device, tempUnits, false, false)
 
+    if (changeableValues.thermostatSetpointStatus != null)
+    {
+        sendEvent(device, [name: "holdStatus", value: changeableValues.thermostatSetpointStatus.toString()])
+    }
+
     def autoChangeover = changeableValues.containsKey("autoChangeoverActive") ? changeableValues.autoChangeoverActive.toString() : "unsupported"
     sendEvent(device, [name: "autoChangeoverActive", value: autoChangeover])
 
@@ -1152,6 +1442,7 @@ def refreshThermostatNew(com.hubitat.app.DeviceWrapper device, def reJson)
     {
         LogDebug("updateThermostats-thermostatOperatingState: ${formatedOperationStatus}")
         sendEvent(device, [name: 'thermostatOperatingState', value: formatedOperationStatus])
+        updateRuntime(device, formatedOperationStatus)
     }
 }
 
@@ -1241,6 +1532,7 @@ def refreshRemoteSensorGroup(List sensors)
             refreshHelper(roomJson.accessories[0], "status", "batterystatus", sensor, null, false, false)
         }
         refreshHelper(roomJson, "roomName", "roomName", sensor, null, false, false)
+        fixPlaceholderSensorLabel(sensor, roomID, roomJson.roomName)
         refreshOccupiedAttr(roomJson, sensor)
     }
 }
@@ -1314,7 +1606,8 @@ def roundSetpoint(BigDecimal value, String units)
     return Math.round(value.doubleValue())
 }
 
-def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
+// holdMode: "permanent" (default), "hours" (TemporaryHold ending holdHours from now) or "resume" (NoHold: return to the schedule). LCC models only.
+def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null, holdMode=null, holdHours=null)
 {
     LogDebug("setThermosatSetPoint()")
     def ids = parseThermostatDni(device.getDeviceNetworkId())
@@ -1391,9 +1684,14 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     heatPoint = roundSetpoint(clampSetpoint(device, heatPoint as BigDecimal, "minHeatSetpoint", "maxHeatSetpoint"), units)
     coolPoint = roundSetpoint(clampSetpoint(device, coolPoint as BigDecimal, "minCoolSetpoint", "maxCoolSetpoint"), units)
 
-    // Honeywell rejects a heat setpoint that isn't below the cool setpoint; move the one that wasn't requested.
+    // Keep heat at or below cool, moving the one that wasn't requested. Only thermostats with Auto (dual setpoint) need the
+    // deadband gap; others use one setpoint at a time and just mustn't be inverted.
     def deadband = device.getDataValue("deadband")
     def gap = (deadband != null && deadband.isNumber() && (deadband as BigDecimal) > 0) ? (deadband as BigDecimal) : (units == "C" ? 1 : 2)
+    if (!allowedModes.contains("Auto"))
+    {
+        gap = 0
+    }
     def heatAndCool = hasSetpointRange(device, "minHeatSetpoint", "maxHeatSetpoint") && hasSetpointRange(device, "minCoolSetpoint", "maxCoolSetpoint")
     if (heatAndCool && heatPoint > coolPoint - gap)
     {
@@ -1416,10 +1714,26 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
             coolSetpoint:coolPoint]
 
     // For LCC devices thermostatSetpointStatus = "NoHold" will return to schedule. "TemporaryHold" will hold the set temperature until "nextPeriodTime". "PermanentHold" will hold the setpoint until user requests another change.
-    // BugBug: Need to include nextPeriodTime if TemporaryHoldIs true
     if (ids.deviceId.startsWith("LCC"))
     {
-        body.thermostatSetpointStatus = "PermanentHold"
+        if (holdMode == "resume")
+        {
+            body.thermostatSetpointStatus = "NoHold"
+        }
+        else if (holdMode == "hours")
+        {
+            body.thermostatSetpointStatus = "TemporaryHold"
+            body.nextPeriodTime = getHoldEndTime((holdHours ?: 2) as Integer)
+        }
+        else
+        {
+            body.thermostatSetpointStatus = "PermanentHold"
+        }
+    }
+    else if (holdMode == "resume")
+    {
+        LogWarn("Resuming the schedule is only supported on Lyric (LCC) thermostats.")
+        return false
     }
 
     if (autoChangeoverActive != null && autoChangeoverActive.toString() != "unsupported")
@@ -1437,7 +1751,11 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     {
         return false
     }
-    LogInfo("SetThermostate() Mode: ${apiMode}; Heatsetpoint: ${heatPoint}; CoolPoint: ${coolPoint} API Response: ${result.status}")
+    LogInfo("SetThermostate() Mode: ${apiMode}; Heatsetpoint: ${heatPoint}; CoolPoint: ${coolPoint}; Hold: ${body.thermostatSetpointStatus ?: 'n/a'}${body.nextPeriodTime ? ' until ' + body.nextPeriodTime : ''} API Response: ${result.status}")
+    if (body.thermostatSetpointStatus)
+    {
+        sendEvent(device, [name: "holdStatus", value: body.thermostatSetpointStatus])
+    }
 
     // Reflect the change immediately; the deferred refresh corrects anything the thermostat didn't accept.
     def hubitatMode = wantEmergencyHeat ? "emergency heat" : toHubitatMode(apiMode)
@@ -1447,6 +1765,21 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     sendEvent(device, [name: "thermostatSetpoint", value: (hubitatMode == "cool" ? coolPoint : heatPoint), unit: units])
     scheduleCommandRefresh()
     return true;
+}
+
+// Hold end for TemporaryHold: hub-local time holdHours from now, rounded up to Honeywell's 15 minute increments, as HH:mm:ss.
+def getHoldEndTime(int holdHours)
+{
+    def quarterHourMs = 15 * 60 * 1000L
+    def endMs = now() + holdHours * 60 * 60 * 1000L
+    endMs = ((long)Math.ceil(endMs / (double)quarterHourMs)) * quarterHourMs
+    return new Date(endMs).format("HH:mm:00")
+}
+
+def resumeThermostatSchedule(com.hubitat.app.DeviceWrapper device)
+{
+    LogDebug("resumeThermostatSchedule()")
+    return setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null, "resume")
 }
 
 def setThermosatFan(com.hubitat.app.DeviceWrapper device, fan=null)
