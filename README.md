@@ -36,5 +36,8 @@ How the app spends API calls:
 - I got a lot of example and inspiration from @dkilgore90 (https://github.com/dkilgore90/google-sdm-api/blob/develop/sdm-api-app.groovy)
 - Credit to Tim in the Hubitat community for patently testing and improving this with me over days/weeks.
 
+## Holds and schedules (Lyric/LCC models)
+Changing a setpoint or mode from Hubitat places a hold on the thermostat's Honeywell schedule. Each thermostat's preferences choose the hold type: **permanent** (default; the schedule stays paused) or **for a number of hours**, after which the thermostat resumes its schedule. The **Resume Schedule** command clears any hold. The current hold is shown in the `holdStatus` attribute.
+
 ## Runtime tracking
 Each thermostat reports `heatingRuntimeToday`, `coolingRuntimeToday`, `heatingRuntimeYesterday` and `coolingRuntimeYesterday` (minutes) and `lastOperatingStateChange`. Runtime is accumulated between polls; a heating/cooling start or stop is assumed to have happened halfway between the two polls that saw it, so timing error is at most half the poll interval (cycles shorter than the interval can still be missed). Gaps longer than 65 minutes (outages, rate limit pauses) are not credited. For exact equipment timing, pair this with a local sensor (e.g. a current clamp or 24VAC call sensor) and use these attributes to see which thermostat was calling.

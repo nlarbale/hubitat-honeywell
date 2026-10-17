@@ -43,6 +43,9 @@ metadata {
         attribute "heatingRuntimeYesterday", "number"
         attribute "coolingRuntimeYesterday", "number"
         attribute "lastOperatingStateChange", "string"
+        attribute "holdStatus", "string"
+
+        command "resumeSchedule"
 
     }
     preferences{
@@ -52,6 +55,14 @@ metadata {
         input ("coolModeEnabled", "bool", 
                 title: "Allow Cool Mode, if false cool mode will be ignored",
                 defaultValue:true)
+        input ("holdMode", "enum",
+                title: "When changing setpoints or mode (Lyric/LCC models)",
+                options: ["permanent":"Hold permanently (schedule paused until resumed)", "hours":"Hold for a number of hours, then resume the schedule"],
+                defaultValue: "permanent")
+        input ("holdHours", "enum",
+                title: "Hours to hold (when holding for a number of hours)",
+                options: ["1":"1", "2":"2", "3":"3", "4":"4", "6":"6", "8":"8", "12":"12"],
+                defaultValue: "2")
         input ("debugLogs", "bool", 
 			   title: "Enable debug logging (turns off after 30 minutes)", 
 			   defaultValue: false)
@@ -101,7 +112,7 @@ void installed()
     device.updateSetting("coolModeEnabled", [value: "true", type: "bool"])
     device.updateSetting("debugLogs", [value: "false", type: "bool"])
     device.updateSetting("descriptionText", [value: "true", type: "bool"])
-    refresh()
+    // The app refreshes all new thermostats with a single call after discovery.
 }
 
 void uninstalled()
@@ -117,7 +128,6 @@ void updated()
     {
         runIn(1800, "disableDebugLog")
     }
-    refresh()
 }
 
 void parse(String message) 
@@ -209,8 +219,8 @@ void setCoolingSetpoint(temperature)
 {
     LogDebug("setCoolingSetpoint() - autoChangeoverActive: ${device.currentValue("autoChangeoverActive")}");
     
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
-    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, temperature))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null, holdMode=null, holdHours=null)
+    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, temperature, holdMode, holdHours))
     {
         LogDescription("Cooling setpoint changed to ${temperature}")
     }
@@ -225,8 +235,8 @@ void setHeatingSetpoint(temperature)
 {
     LogDebug("setHeatingSetpoint() - autoChangeoverActive: ${device.currentValue("autoChangeoverActive")}");
 
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
-    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), temperature, null))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null, holdMode=null, holdHours=null)
+    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), temperature, null, holdMode, holdHours))
     {
         LogDescription("Heating setpoint changed to ${temperature}")
     }
@@ -285,14 +295,27 @@ void setThermostatMode(thermostatmode)
         return
     }
 
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
-    if (parent.setThermosatSetPoint(device, mode, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null, holdMode=null, holdHours=null)
+    if (parent.setThermosatSetPoint(device, mode, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null, holdMode, holdHours))
     {
         LogDescription("mode changed to ${mode}")
     }
     else
     {
         LogWarn("Set mode to ${mode} failed.")
+    }
+}
+
+void resumeSchedule()
+{
+    LogDebug("resumeSchedule called");
+    if (parent.resumeThermostatSchedule(device))
+    {
+        LogDescription("schedule resumed")
+    }
+    else
+    {
+        LogWarn("Resume schedule failed.")
     }
 }
 

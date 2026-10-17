@@ -487,6 +487,20 @@ def parseThermostatDni(String dni)
     return [locationId: dni.substring(0, delimiter), deviceId: dni.substring(delimiter + 3)]
 }
 
+// Sensors created while room names couldn't be fetched (e.g. rate limited) are labelled "... Thermostat Sensor: Room <id>".
+// Replace that placeholder with the real room name; labels the user changed are left alone.
+def fixPlaceholderSensorLabel(com.hubitat.app.DeviceWrapper sensor, roomId, roomName)
+{
+    def label = sensor.getLabel()
+    def placeholderSuffix = " Thermostat Sensor: Room ${roomId}".toString()
+    if (roomName && label?.endsWith(placeholderSuffix) && roomName.toString() != "Room ${roomId}".toString())
+    {
+        def newLabel = label.substring(0, label.length() - placeholderSuffix.length()) + " Thermostat Sensor: ${roomName}"
+        LogInfo("Renaming sensor '${label}' to '${newLabel}'")
+        sensor.setLabel(newLabel)
+    }
+}
+
 def isRemoteSensor(com.hubitat.app.DeviceWrapper device)
 {
     return device.hasAttribute("roomId") && device.hasAttribute("parentDeviceId")
@@ -687,6 +701,8 @@ def discoverDevices()
         return
     }
 
+    def addedThermostats = false
+    def addedSensors = false
     result.data?.each {locations ->
         def locationID = locations.locationID.toString()
         LogDebug("LocationID: ${locationID}");
@@ -704,6 +720,7 @@ def discoverDevices()
                                     name : "Honeywell - ${dev.deviceModel.toString()} - ${dev.deviceID.toString()}",
                                     label: dev.userDefinedDeviceName.toString()
                             ])
+                    addedThermostats = true
                  }
                 catch (com.hubitat.app.exception.UnknownDeviceTypeException e) {
                     LogInfo("${e.message} - you need to install the appropriate driver.")
@@ -741,12 +758,17 @@ def discoverDevices()
                                                 name : "Honeywell Home Remote Sensor",
                                                 label: "${dev.userDefinedDeviceName} Thermostat Sensor: ${roomName}"
                                         ])
+                                    addedSensors = true
                                 }
                                 catch (com.hubitat.app.exception.UnknownDeviceTypeException e)
                                 {
                                     LogInfo("${e.message} - you need to install the appropriate driver.")
                                     return
                                 }
+                            }
+                            else
+                            {
+                                fixPlaceholderSensorLabel(sensor, room, roomNames[room as Integer])
                             }
 
                             // (Re)apply identifiers so rediscovery repairs existing sensors too.
@@ -760,6 +782,16 @@ def discoverDevices()
                 }
             }
         }
+    }
+
+    // New devices don't refresh themselves; populate them all with one call (plus one per thermostat with new sensors).
+    if (addedThermostats)
+    {
+        RefreshAllDevicesUnified()
+    }
+    if (addedSensors)
+    {
+        RefreshAllRemoteSensors(true)
     }
 }
 
@@ -1333,6 +1365,11 @@ def refreshThermostatNew(com.hubitat.app.DeviceWrapper device, def reJson)
     refreshHelper(changeableValues, "heatSetpoint", "heatingSetpoint", device, tempUnits, false, false)
     refreshHelper(changeableValues, "coolSetpoint", "coolingSetpoint", device, tempUnits, false, false)
 
+    if (changeableValues.thermostatSetpointStatus != null)
+    {
+        sendEvent(device, [name: "holdStatus", value: changeableValues.thermostatSetpointStatus.toString()])
+    }
+
     def autoChangeover = changeableValues.containsKey("autoChangeoverActive") ? changeableValues.autoChangeoverActive.toString() : "unsupported"
     sendEvent(device, [name: "autoChangeoverActive", value: autoChangeover])
 
@@ -1495,6 +1532,7 @@ def refreshRemoteSensorGroup(List sensors)
             refreshHelper(roomJson.accessories[0], "status", "batterystatus", sensor, null, false, false)
         }
         refreshHelper(roomJson, "roomName", "roomName", sensor, null, false, false)
+        fixPlaceholderSensorLabel(sensor, roomID, roomJson.roomName)
         refreshOccupiedAttr(roomJson, sensor)
     }
 }
@@ -1568,7 +1606,8 @@ def roundSetpoint(BigDecimal value, String units)
     return Math.round(value.doubleValue())
 }
 
-def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
+// holdMode: "permanent" (default), "hours" (TemporaryHold ending holdHours from now) or "resume" (NoHold: return to the schedule). LCC models only.
+def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null, holdMode=null, holdHours=null)
 {
     LogDebug("setThermosatSetPoint()")
     def ids = parseThermostatDni(device.getDeviceNetworkId())
@@ -1645,9 +1684,14 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     heatPoint = roundSetpoint(clampSetpoint(device, heatPoint as BigDecimal, "minHeatSetpoint", "maxHeatSetpoint"), units)
     coolPoint = roundSetpoint(clampSetpoint(device, coolPoint as BigDecimal, "minCoolSetpoint", "maxCoolSetpoint"), units)
 
-    // Honeywell rejects a heat setpoint that isn't below the cool setpoint; move the one that wasn't requested.
+    // Keep heat at or below cool, moving the one that wasn't requested. Only thermostats with Auto (dual setpoint) need the
+    // deadband gap; others use one setpoint at a time and just mustn't be inverted.
     def deadband = device.getDataValue("deadband")
     def gap = (deadband != null && deadband.isNumber() && (deadband as BigDecimal) > 0) ? (deadband as BigDecimal) : (units == "C" ? 1 : 2)
+    if (!allowedModes.contains("Auto"))
+    {
+        gap = 0
+    }
     def heatAndCool = hasSetpointRange(device, "minHeatSetpoint", "maxHeatSetpoint") && hasSetpointRange(device, "minCoolSetpoint", "maxCoolSetpoint")
     if (heatAndCool && heatPoint > coolPoint - gap)
     {
@@ -1670,10 +1714,26 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
             coolSetpoint:coolPoint]
 
     // For LCC devices thermostatSetpointStatus = "NoHold" will return to schedule. "TemporaryHold" will hold the set temperature until "nextPeriodTime". "PermanentHold" will hold the setpoint until user requests another change.
-    // BugBug: Need to include nextPeriodTime if TemporaryHoldIs true
     if (ids.deviceId.startsWith("LCC"))
     {
-        body.thermostatSetpointStatus = "PermanentHold"
+        if (holdMode == "resume")
+        {
+            body.thermostatSetpointStatus = "NoHold"
+        }
+        else if (holdMode == "hours")
+        {
+            body.thermostatSetpointStatus = "TemporaryHold"
+            body.nextPeriodTime = getHoldEndTime((holdHours ?: 2) as Integer)
+        }
+        else
+        {
+            body.thermostatSetpointStatus = "PermanentHold"
+        }
+    }
+    else if (holdMode == "resume")
+    {
+        LogWarn("Resuming the schedule is only supported on Lyric (LCC) thermostats.")
+        return false
     }
 
     if (autoChangeoverActive != null && autoChangeoverActive.toString() != "unsupported")
@@ -1691,7 +1751,11 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     {
         return false
     }
-    LogInfo("SetThermostate() Mode: ${apiMode}; Heatsetpoint: ${heatPoint}; CoolPoint: ${coolPoint} API Response: ${result.status}")
+    LogInfo("SetThermostate() Mode: ${apiMode}; Heatsetpoint: ${heatPoint}; CoolPoint: ${coolPoint}; Hold: ${body.thermostatSetpointStatus ?: 'n/a'}${body.nextPeriodTime ? ' until ' + body.nextPeriodTime : ''} API Response: ${result.status}")
+    if (body.thermostatSetpointStatus)
+    {
+        sendEvent(device, [name: "holdStatus", value: body.thermostatSetpointStatus])
+    }
 
     // Reflect the change immediately; the deferred refresh corrects anything the thermostat didn't accept.
     def hubitatMode = wantEmergencyHeat ? "emergency heat" : toHubitatMode(apiMode)
@@ -1701,6 +1765,21 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     sendEvent(device, [name: "thermostatSetpoint", value: (hubitatMode == "cool" ? coolPoint : heatPoint), unit: units])
     scheduleCommandRefresh()
     return true;
+}
+
+// Hold end for TemporaryHold: hub-local time holdHours from now, rounded up to Honeywell's 15 minute increments, as HH:mm:ss.
+def getHoldEndTime(int holdHours)
+{
+    def quarterHourMs = 15 * 60 * 1000L
+    def endMs = now() + holdHours * 60 * 60 * 1000L
+    endMs = ((long)Math.ceil(endMs / (double)quarterHourMs)) * quarterHourMs
+    return new Date(endMs).format("HH:mm:00")
+}
+
+def resumeThermostatSchedule(com.hubitat.app.DeviceWrapper device)
+{
+    LogDebug("resumeThermostatSchedule()")
+    return setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null, "resume")
 }
 
 def setThermosatFan(com.hubitat.app.DeviceWrapper device, fan=null)
