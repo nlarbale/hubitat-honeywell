@@ -10,12 +10,21 @@ I would consider this beta code, there are definitely rough edges that still nee
 - Authenticate with Honeywell (establish OAuth Link)
 - Discover devices
 
+## API keys and rate limits
+The app no longer ships a shared Consumer Key/Secret. Create your own (free) at https://developer.honeywellhome.com/ and enter it under Login Options; the per-key rate limit is the main constraint on how often devices can be polled.
+
+How the app spends API calls:
+- **Thermostat polling**: one call per interval covers every thermostat on the account (default every 10 minutes).
+- **Remote sensor polling**: separate, optional interval (off by default). One call per interval for each thermostat that has enabled sensors, no matter how many sensors it has. Disable a sensor device to stop polling it; if all sensors on a thermostat are disabled no call is made.
+- **Commands**: the change is reflected on the device immediately, then a single refresh of all thermostats runs ~15 seconds later. Several commands in quick succession share that one refresh.
+- **Rate limited (HTTP 429)**: scheduled polling pauses (honoring `Retry-After`, otherwise 15 minutes) and the app page shows when it resumes. Commands still go through.
+
 ### Not Yet Implemented/Tested
 - Events (honeywell supports Azure Event Grid, that needs to be implemented and might require per user accounts)
 - Schedules via Honeywelll (I am using the Hubitat Thermostat Scheduler personally)
 - Celsius (I put some code in for this but didn't test it)
 - Name changes (if you change the name of the device)
-- Tokens seems to require forced refresh from time to time (there is a scheduled refresh and a force option in the debug menu).
+- If Honeywell rejects the refresh token the app page shows a reconnect message; use Login Options > Connect to Honeywell.
 
 ## Credits
 - I got a lot of example and inspiration from @dkilgore90 (https://github.com/dkilgore90/google-sdm-api/blob/develop/sdm-api-app.groovy)

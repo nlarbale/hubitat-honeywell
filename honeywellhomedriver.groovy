@@ -1,5 +1,5 @@
 /*
-Hubitat Driver For Honeywell Thermistate
+Hubitat Driver For Honeywell Thermostat
 
 Copyright 2020 - Taylor Brown
 
@@ -21,7 +21,7 @@ import groovy.json.JsonOutput
 metadata {
     definition (
         name: "Honeywell Home Thermostat", 
-        description:"Driver for Lyric (LCC) and T series (TCC) Honeywell Thermostats, Requires corisponding Honeywell Home App.",
+        description:"Driver for Lyric (LCC) and T series (TCC) Honeywell Thermostats, Requires corresponding Honeywell Home App.",
         importUrl:"https://raw.githubusercontent.com/thecloudtaylor/hubitat-honeywell/main/honeywellhomedriver.groovy",
         namespace: "thecloudtaylor", 
         author: "Taylor Brown") {
@@ -34,21 +34,21 @@ metadata {
         //Maybe?
 		capability "Sensor"
 		attribute "thermostatFanState", "enum", ["true", "false"]
-		attribute "emergencyHeatActive", "enum", [null, "true", "false"]
+		attribute "emergencyHeatActive", "enum", ["unsupported", "true", "false"]
         attribute "autoChangeoverActive", "enum", ["unsupported", "true", "false"]
-        attribute "allowedModes", "enum", ["EmergencyHeat", "Heat", "Off", "Cool","Auto"]
+        attribute "allowedModes", "string"
         attribute "units", "enum", ["F", "C"]
 
     }
     preferences{
         input ("heatModeEnabled", "bool", 
-                title: "Allow Heat Mode, if false heat mode will be iqnored",
+                title: "Allow Heat Mode, if false heat mode will be ignored",
                 defaultValue:true)
         input ("coolModeEnabled", "bool", 
-                title: "Allow Cool Mode, if false heat mode will be iqnored",
+                title: "Allow Cool Mode, if false cool mode will be ignored",
                 defaultValue:true)
         input ("debugLogs", "bool", 
-			   title: "Enable debug logging", 
+			   title: "Enable debug logging (turns off after 30 minutes)", 
 			   defaultValue: false)
 		input ("descriptionText", "bool", 
 			   title: "Enable description text logging", 
@@ -69,6 +69,14 @@ void LogInfo(logMessage)
     log.info "${device.displayName} ${logMessage}";
 }
 
+void LogDescription(logMessage)
+{
+    if(descriptionText != false)
+    {
+        log.info "${device.displayName} ${logMessage}";
+    }
+}
+
 void LogWarn(logMessage)
 {
     log.warn "${device.displayName} ${logMessage}";
@@ -83,10 +91,11 @@ void disableDebugLog()
 void installed()
 {
     LogInfo("Installing.");
-    heatModeEnabled = true
-    coolModeEnabled = true
-    debugLogs = false
-    descriptionText = true
+    // Persist the defaults; preference defaultValues aren't saved until the user hits Save Preferences.
+    device.updateSetting("heatModeEnabled", [value: "true", type: "bool"])
+    device.updateSetting("coolModeEnabled", [value: "true", type: "bool"])
+    device.updateSetting("debugLogs", [value: "false", type: "bool"])
+    device.updateSetting("descriptionText", [value: "true", type: "bool"])
     refresh()
 }
 
@@ -98,6 +107,11 @@ void uninstalled()
 void updated() 
 {
     LogInfo("Updating.");
+    unschedule("disableDebugLog")
+    if (debugLogs)
+    {
+        runIn(1800, "disableDebugLog")
+    }
     refresh()
 }
 
@@ -106,11 +120,30 @@ void parse(String message)
     LogDebug("ParseCalled: ${message}");
 }
 
+// Supported mode attributes are JSON arrays; older app versions stored a Groovy list string.
+private boolean isSupported(String attributeName, String value)
+{
+    def raw = device.currentValue(attributeName)
+    if (raw == null)
+    {
+        // Not reported yet; let the API decide.
+        return true
+    }
+    try
+    {
+        return new JsonSlurper().parseText(raw.toString()).contains(value)
+    }
+    catch (Exception ignored)
+    {
+        return raw.toString().contains(value)
+    }
+}
+
 void auto()
 {
     LogDebug("auto called");
 
-    if(device.currentValue("allowedModes").contains("Auto"))
+    if(isSupported("allowedModes", "Auto"))
     {
         setThermostatMode("auto")
     }
@@ -131,8 +164,7 @@ void emergencyHeat()
 {
     LogDebug("emergencyHeat called");
 
-    LogWarn("EmergancyHeat Not Supported")
-    
+    setThermostatMode("emergency heat")
 }
 
 void fanAuto()
@@ -172,16 +204,14 @@ void setCoolingSetpoint(temperature)
 {
     LogDebug("setCoolingSetpoint() - autoChangeoverActive: ${device.currentValue("autoChangeoverActive")}");
     
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, heatPoint=null, coolPoint=null)
-    if (!parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, temperature))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
+    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, temperature))
     {
-        LogWarn("Set cooling point failed, attempting a refresh and re-try.")
-        parent.refreshThermosat(device)
-        parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, temperature)
+        LogDescription("Cooling setpoint changed to ${temperature}")
     }
     else
     {
-        LogInfo("Cooling setpoint changed to ${temperature}")
+        LogWarn("Set cooling point to ${temperature} failed.")
     }
 }
 
@@ -190,16 +220,14 @@ void setHeatingSetpoint(temperature)
 {
     LogDebug("setHeatingSetpoint() - autoChangeoverActive: ${device.currentValue("autoChangeoverActive")}");
 
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, heatPoint=null, coolPoint=null)
-    if (!parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), temperature, null))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
+    if (parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), temperature, null))
     {
-        LogWarn("Set heating point failed, attempting a refresh and re-try.")
-        parent.refreshThermosat(device)
-        parent.setThermosatSetPoint(device, null, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), temperature, null)
+        LogDescription("Heating setpoint changed to ${temperature}")
     }
     else
     {
-        LogInfo("Heating setpoint changed to ${temperature}")
+        LogWarn("Set heating point to ${temperature} failed.")
     }
 }
 
@@ -213,18 +241,17 @@ void setSchedule(JSON_OBJECT)
 void setThermostatFanMode(fanmode)
 {
     LogDebug("setThermostatFanMode called");
-    
-    if(device.currentValue("supportedThermostatFanModes").contains(fanmode))
+
+    def mode = fanmode?.toString()?.toLowerCase()
+    if(isSupported("supportedThermostatFanModes", mode))
     {
-        if(!parent.setThermosatFan(device, fanmode))
+        if(parent.setThermosatFan(device, mode))
         {
-            LogWarn("Set fan mode failed, attempting a refresh and re-try.")
-            parent.refreshThermosat(device)
-            parent.setThermosatFan(device, fanmode);
+            LogDescription("Fan Mode Changed to: ${mode}")
         }
         else
         {
-            LogInfo("Fan Mode Chanaged to: ${fanmode}")
+            LogWarn("Set fan mode to ${mode} failed.")
         }
     }
     else
@@ -238,33 +265,34 @@ void setThermostatMode(thermostatmode)
 {
     LogDebug("setThermostatMode() - autoChangeoverActive: ${device.currentValue("autoChangeoverActive")}");
 
-    if (thermostatmode == "heat" && !heatModeEnabled)
+    def mode = thermostatmode?.toString()?.toLowerCase()
+
+    // Only an explicit false disables a mode; null means the preference was never saved.
+    if ((mode == "heat" || mode == "emergency heat") && heatModeEnabled == false)
     {
-        LogInfo("Heating Mode Requested but Not Allowed, Iqnoring")
+        LogInfo("Heating Mode Requested but Not Allowed, Ignoring")
         return
     }
 
-    if (thermostatmode == "cool" && !coolModeEnabled)
+    if (mode == "cool" && coolModeEnabled == false)
     {
-        LogInfo("Cooling Mode Requested but Not Allowed, Iqnoring")
+        LogInfo("Cooling Mode Requested but Not Allowed, Ignoring")
         return
     }
 
-    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, heatPoint=null, coolPoint=null)
-    if (!parent.setThermosatSetPoint(device, thermostatmode, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null))
+    //setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoChangeoverActive=false, emergencyHeatActive=null, heatPoint=null, coolPoint=null)
+    if (parent.setThermosatSetPoint(device, mode, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null))
     {
-        LogWarn("Set point failed, attempting a refresh and re-try.")
-        parent.refreshThermosat(device)
-        parent.setThermosatSetPoint(device, thermostatmode, device.currentValue("autoChangeoverActive"), device.currentValue("emergencyHeatActive"), null, null);
+        LogDescription("mode changed to ${mode}")
     }
     else
     {
-        LogInfo("mode changed to ${thermostatmode}")
+        LogWarn("Set mode to ${mode} failed.")
     }
 }
 
 void refresh()
 {
     LogDebug("Refresh called");
-    parent.refreshThermosat(device)
+    parent.refreshSingleThermostat(device)
 }
