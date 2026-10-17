@@ -28,7 +28,7 @@ metadata {
 			name: "Honeywell Home Remote Sensor",
 			namespace: "thecloudtaylor",
 			description:"Driver for Honeywell Home Remote Sensors, requires corresponding Honeywell Home App.",
-			importUrl:"https://raw.githubusercontent.com/thecloudtaylor/hubitat-honeywell/main/honeywellremotesensordriver.groovy",
+			importUrl:"https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellremotesensordriver.groovy",
 			author: "Tim Yuhl") {
 			capability 	"Temperature Measurement"
 			capability  "Relative Humidity Measurement"

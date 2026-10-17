@@ -5,7 +5,12 @@ An app and driver for the Honeywell Home thermostats (Lyric, T5, T9 etc…). Thi
 I would consider this beta code, there are definitely rough edges that still need to be worked out but it’s running in “production” at my house. Feel free to submit pull requests for improvements, on major improvements I will rev the release and the package.
 
 ## Install
-- Import the driver and the app (or use Hubitat Package Manager)
+- In Hubitat, add each file via **Apps Code / Drivers Code > New > Import** using these URLs:
+  - https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellhomeapp.groovy
+  - https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellhomedriver.groovy
+  - https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellremotesensordriver.groovy
+
+  After that, the **Import** button on each code page re-pulls from the same URL. (The Hubitat Package Manager package still points at the upstream thecloudtaylor repo; don't apply its updates over this fork.)
 - Create a new instance of the app.
 - Authenticate with Honeywell (establish OAuth Link)
 - Discover devices

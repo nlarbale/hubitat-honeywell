@@ -40,7 +40,7 @@ definition(
         namespace: "thecloudtaylor",
         author: "Taylor Brown",
         description: "App for Lyric (LCC) and T series (TCC) Honeywell Thermostats, requires corresponding driver.",
-        importUrl:"https://raw.githubusercontent.com/thecloudtaylor/hubitat-honeywell/main/honeywellhomeapp.groovy",
+        importUrl:"https://raw.githubusercontent.com/nlarbale/hubitat-honeywell/main/honeywellhomeapp.groovy",
         category: "Thermostate",
         iconUrl: "",
         iconX2Url: "")
