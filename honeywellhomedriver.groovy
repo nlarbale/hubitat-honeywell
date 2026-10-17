@@ -38,6 +38,11 @@ metadata {
         attribute "autoChangeoverActive", "enum", ["unsupported", "true", "false"]
         attribute "allowedModes", "string"
         attribute "units", "enum", ["F", "C"]
+        attribute "heatingRuntimeToday", "number"
+        attribute "coolingRuntimeToday", "number"
+        attribute "heatingRuntimeYesterday", "number"
+        attribute "coolingRuntimeYesterday", "number"
+        attribute "lastOperatingStateChange", "string"
 
     }
     preferences{
