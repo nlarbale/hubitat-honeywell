@@ -24,7 +24,7 @@ import groovy.json.JsonOutput
 import groovy.transform.Field
 
 
-@Field static String global_apiURL = "https://api.honeywell.com"
+@Field static String global_apiURL = "https://api.honeywellhome.com"
 @Field static String global_redirectURL = "https://cloud.hubitat.com/oauth/stateredirect"
 
 definition(
@@ -593,24 +593,129 @@ def loginResponse(response)
     }
 }
 
-def RefreshAllDevices()
-{
-    LogDebug("RefreshAllDevices()");
+def RefreshAllDevicesUnified(retry=false)
+{ 
+    LogDebug("RefreshAllDevicesUnified()");
+    
 
+
+/*    def honeywellLocation = ""
+    // first find all locations from the child devices
     def children = getChildDevices()
     children.each 
     {
         if (it != null) 
         {
-            // Thermostat or Sensor?
-            if (it.hasAttribute("groupId") && it.hasAttribute("roomId")) {
-                refreshRemoteSensor(it)
-            }
-            else {
-                refreshThermosat(it)
-            }
+            def deviceID = it.getDeviceNetworkId();	
+            def locDelminator = deviceID.indexOf('-');
+            honeywellLocation = deviceID.substring(0, (locDelminator-1))
+            
+            LogDebug("Got location: ${honeywellLocation}");
+            
+            LogDebug("Device: ${it.deviceID}")
+            
         }
     }
+    
+    LogDebug("Attempting to Update all devices With LocationID: ${honeywellLocation}");*/
+
+//    def uri = global_apiURL + '/v2/devices?apikey=' + settings.consumerKey + '&locationId=' + honeywellLocation
+    def uri = global_apiURL + '/v2/locations?apikey=' + settings.consumerKey
+    def headers = [ Authorization: 'Bearer ' + state.access_token ]
+    def contentType = 'application/json'
+    def params = [ uri: uri, headers: headers, contentType: contentType ]
+    LogDebug("Location Discovery-params ${params}")
+
+    //add error checking
+    def reJson =''
+    try 
+    {
+        httpGet(params) 
+        { 
+            response ->
+            def reCode = response.getStatus();
+            reJson = response.getData();
+            LogDebug("reCode: {$reCode}")
+            LogDebug("reJson: {$reJson}")
+        }
+    }
+    catch (groovyx.net.http.HttpResponseException e) 
+    {
+        if (e.getStatusCode() == 401 && !retry)
+        {
+            LogWarn('Authorization token expired, will refresh and retry.')
+            refreshToken()
+            RefreshAllDevicesUnified(true)
+        }
+
+        LogError("Thermosat API failed -- ${e.getLocalizedMessage()}: ${e.response.data}")
+        return;
+    }
+    
+    LogDebug("total number of locations in response ${reJson.results.size()}")
+
+    for (i in 0..(reJson.results.size() -1 ) ) {
+    
+		locationsJson = reJson[i]
+
+    	// get all devices for location, then iterate over devices and assign attribues
+	    LogDebug("Total number of devices in response ${locationsJson.devices.size()}")
+    
+    	def currentDevice = null;
+
+    	for(j in 0..(locationsJson.devices.size() -1 ) ) {
+        
+	        currentDevice = null
+        
+			deviceJson = locationsJson.devices[j]
+        
+        	LogDebug("deviceJson : ${deviceJson}")
+        
+			if (deviceJson.deviceType != null && 
+                deviceJson.deviceType != "Thermostat") {
+				LogDebug("Non thermostat device ${deviceJson.deviceDetails.deviceClass} - skipping")
+				continue
+			}
+
+
+        	children = getChildDevices()
+	        children.each 
+			{   
+           		if (it != null) 
+           		{ 
+               		deviceID = it.getDeviceNetworkId();
+	                locDelimiter = deviceID.indexOf('-');
+    	            honeywellDeviceID = deviceID.substring((locDelimiter+2))
+               
+        	        //LogDebug("CurrentDevice ID ${deviceJson.deviceID} honeywellDeviceId ${honeywellDeviceID}")
+               
+	                if (honeywellDeviceID == deviceJson.deviceID) {
+		            	currentDevice = it
+                   		LogDebug("Found Device ${honeywellDeviceID}")
+                            
+               		}
+           		}
+        	}
+               
+        	if (currentDevice != null) {
+            	LogDebug("Refreshing Current Device ID ${currentDevice.getDeviceId}")
+        
+            	refreshThermostatNew(currentDevice, deviceJson)
+            
+        	}
+        
+    	}
+	}
+                
+}
+
+def RefreshAllDevices()
+{
+    LogDebug("RefreshAllDevices()");
+    
+    RefreshAllDevicesUnified()
+    return;
+
 }
 
 def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceWrapper device, optionalUnits=null, optionalMakeLowerMap=false, optionalMakeLowerString=false)
@@ -655,9 +760,11 @@ def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceW
     return true;
 }
 
-def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
+// when refreshing a single device 
+def refreshSingleThermostat(com.hubitat.app.DeviceWrapper device, retry = false)
 {
-    LogDebug("refreshThermosat()")
+
+    LogDebug("refreshSingleThermostat()")
 
     def deviceID = device.getDeviceNetworkId();
     def locDelminator = deviceID.indexOf('-');
@@ -691,12 +798,22 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
         {
             LogWarn('Authorization token expired, will refresh and retry.')
             refreshToken()
-            refreshThermosat(device, true)
+            refreshSingleThermostat(device, true)
         }
 
         LogError("Thermosat API failed -- ${e.getLocalizedMessage()}: ${e.response.data}")
         return;
     }
+
+    refreshThermostatNew(device, reJson)
+
+}
+
+// refactored
+def refreshThermostatNew(com.hubitat.app.DeviceWrapper device, def reJson)
+{
+
+    LogDebug("refreshThermostatNew()")
 
     def tempUnits = "F"
     if (reJson.units != "Fahrenheit")
@@ -765,6 +882,8 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
 
     LogDebug("updateThermostats-thermostatOperatingState: ${formatedOperationStatus}")
     sendEvent(device, [name: 'thermostatOperatingState', value: formatedOperationStatus])
+
+
 }
 
 String getRemoteSensorUserDefName(String parentDeviceId, String locationId, String groupId, int roomId, retry=false)
@@ -856,6 +975,12 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
     def params = [ uri: uri, headers: headers, contentType: contentType ]
+    
+    if (device.isDisabled()) {
+        LogDebug("refreshRemoteSensor - device disabled")
+        return;
+    }
+    
     LogDebug("refreshRemoteSensor - params ${params}")
 
     //add error checking
@@ -1021,7 +1146,7 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
         return false;
     }
 
-    refreshThermosat(device)
+    refreshSingleThermostat(device)
     return true;
 }
 
@@ -1087,6 +1212,7 @@ def setThermosatFan(com.hubitat.app.DeviceWrapper device, fan=null, retry=false)
         return false;
     }
 
-    refreshThermosat(device)
+    refreshSingleThermostat(device)
     return true;
 }
+
