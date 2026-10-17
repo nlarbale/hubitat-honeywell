@@ -523,6 +523,15 @@ def migrateTokensToAtomicState()
     }
 }
 
+// A new connection may use a different consumer key with its own quota, so earlier pauses and counts no longer apply.
+def resetRateLimitState()
+{
+    atomicState.rateLimitedUntil = null
+    atomicState.rateLimitBackoffSec = null
+    atomicState.apiUsage = null
+    LogInfo("Connected to Honeywell; cleared rate limit pause and API call counts.")
+}
+
 def isRateLimited()
 {
     def until = atomicState.rateLimitedUntil
@@ -810,6 +819,10 @@ def handleAuthRedirect()
                         redirect_uri:global_redirectURL
         ]
         connected = requestToken(body).ok
+        if (connected)
+        {
+            resetRateLimitState()
+        }
     }
     else
     {
